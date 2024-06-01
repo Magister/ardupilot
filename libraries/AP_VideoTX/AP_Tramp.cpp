@@ -29,7 +29,7 @@
 #define AP_TRAMP_UART_BUFSIZE_TX      32
 
 // Define periods between requests
-#define TRAMP_MIN_REQUEST_PERIOD_US (200 * 1000) // 200ms
+#define TRAMP_MIN_REQUEST_PERIOD_US (600 * 1000) // 600ms
 #define TRAMP_STATUS_REQUEST_PERIOD_US (1000 * 1000) // 1s
 
 //#define TRAMP_DEBUG
@@ -355,8 +355,19 @@ void AP_Tramp::process_requests()
                 // Set flag
                 configUpdateRequired = true;
             } else if (vtx.update_options()) {
-                // Pit mode needs to be updated, issue request
-                send_command('I', vtx.has_option(AP_VideoTX::VideoOptions::VTX_PITMODE) ? 0 : 1);
+                debug("Updating PIT mode to %u\n", vtx.has_option(AP_VideoTX::VideoOptions::VTX_PITMODE) ? 0 : 1);
+                if (vtx.has_option(AP_VideoTX::VideoOptions::VTX_PITMODE)) {
+                    // we cannot turn PIT off, so just set minimum power if needed
+                    if (vtx.get_configured_power_mw() != 25) {
+                        debug("PIT mode cannot be turned on, switching to minimum power");
+                        vtx.set_configured_options(vtx.get_configured_options() & ~uint8_t(AP_VideoTX::VideoOptions::VTX_PITMODE));
+                        vtx.set_configured_power_mw(25);
+                        send_command('P', 25);
+                    }
+                } else {
+                    // Pit mode needs to be updated, issue request
+                    send_command('I', 0);
+                }
 
                 // Set flag
                 configUpdateRequired = true;
