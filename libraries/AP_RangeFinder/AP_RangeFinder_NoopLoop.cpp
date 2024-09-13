@@ -24,11 +24,6 @@
 
 extern const AP_HAL::HAL& hal;
 
-#define NOOPLOOP_FRAME_HEADER 0x57
-#define NOOPLOOP_FRAME_HEADER_1 0x00
-#define NOOPLOOP_FRAME_LENGTH 16
-#define NOOPLOOP_DIST_MAX_MM 8000
-
 // format of serial packets received from NoopLoop TOF Sense P and F lidar
 //
 // Data Bit             Definition             Description
@@ -44,6 +39,21 @@ extern const AP_HAL::HAL& hal;
 // byte 14              (Reserved)
 // byte 15              Checksum
 
+inline int32_t NLink_ParseInt24(nint24_t data)
+{
+    uint8_t *byte = (uint8_t *)(&data);
+    return (int32_t)(byte[0] << 8 | byte[1] << 16 | byte[2] << 24) / 256;
+}
+
+inline bool verifyCheckSum(uint8_t *data, int32_t length)
+{
+    uint8_t sum = 0;
+    for (int32_t i = 0; i < length - 1; ++i) {
+        sum += data[i];
+    }
+    return sum == data[length - 1];
+}
+
 // distance returned in reading_m
 bool AP_RangeFinder_NoopLoop::get_reading(float &reading_m)
 {
@@ -51,53 +61,73 @@ bool AP_RangeFinder_NoopLoop::get_reading(float &reading_m)
         return false;
     }
 
+    int32_t sum = 0;            // sum of all readings taken
+    uint32_t sq = 0;            // sum of all signal qualities
+    uint16_t valid_count = 0;   // number of valid readings
+    uint16_t invalid_count = 0; // number of invalid readings
+
     // read any available lines from the lidar
+    nts_frame0_raw_t *frame0 = (nts_frame0_raw_t *)buffer;
     uint32_t nbytes = uart->available();
     while (nbytes-- > 0) {
         uint8_t c;
         if (!uart->read(c)) {
             break;
         }
-        // if buffer is empty and this byte is 0x57, add to buffer
-        if (linebuf_len == 0) {
-            if (c == NOOPLOOP_FRAME_HEADER) {
-                linebuf[linebuf_len++] = c;
-            }
-        } else if (linebuf_len == 1) {
-            // if buffer has 1 element and this byte is 0x00, add it to buffer
-            // if not clear the buffer
-            if (c == NOOPLOOP_FRAME_HEADER_1) {
-                linebuf[linebuf_len++] = c;
-            } else {
-                linebuf_len = 0;
-            }
-        } else {
-            // add character to buffer
-            linebuf[linebuf_len++] = c;
-            // if buffer now has 16 items try to decode it
-            if (linebuf_len == NOOPLOOP_FRAME_LENGTH) {
-                // calculate checksum
-                uint8_t checksum = 0;
-                for (uint8_t i=0; i<NOOPLOOP_FRAME_LENGTH-1; i++) {
-                    checksum += linebuf[i];
-                }
-                // if checksum matches extract contents
-                if (checksum == linebuf[NOOPLOOP_FRAME_LENGTH-1]) {
-                    // calculate distance
-                    const int32_t dist = (int32_t)(linebuf[8] << 8 | linebuf[9] << 16 | linebuf[10] << 24) / 256;
-                    const uint8_t valid = (linebuf[11]);
-                    if (dist > 0 && reading_m < NOOPLOOP_DIST_MAX_MM && valid < 255) {
-                        reading_m = dist * 0.001f;
-                        linebuf_len = 0;
-                        uart->discard_input();
-                        return true;
-                    }
-                }
-                // clear buffer
-                linebuf_len = 0;
-                uart->discard_input();
-            }
+        // Add byte to buffer
+        if (bufferPtr < NOOPLOOP_FRAME_LENGTH) {
+            buffer[bufferPtr++] = c;
         }
+
+        // Check header bytes
+        if ((bufferPtr == 1) && (frame0->header[0] != NOOPLOOP_FRAME_HEADER)) {
+            bufferPtr = 0;
+            continue;
+        }
+        if ((bufferPtr == 2) && (frame0->header[1] != NOOPLOOP_FRAME_HEADER_1)) {
+            bufferPtr = 0;
+            continue;
+        }
+
+        // Check for complete packet
+        if (bufferPtr == NOOPLOOP_FRAME_LENGTH) {
+            if (verifyCheckSum(buffer, NOOPLOOP_FRAME_LENGTH)) {
+                // Valid packet
+                int32_t distance_mm = NLink_ParseInt24(frame0->dis);
+                if (distance_mm == 0 || frame0->dis_status == 0) {
+                    // invalid reading
+                    invalid_count++;
+                } else {
+                    // correct data
+                    max_reported_distance_mm = MAX(max_reported_distance_mm, distance_mm);
+                    sum += distance_mm;
+                    sq += frame0->signal_strength;
+                    valid_count++;
+                }
+            }
+            // Prepare for new packet
+            bufferPtr = 0;
+        }
+    }
+
+    // return average of all valid readings
+    if (valid_count > 0) {
+        reading_m = (sum / valid_count) * 0.001f; // sensor reports mm, we need m;
+        sq = sq / valid_count;
+        if (sq > RangeFinder::SIGNAL_QUALITY_MAX) {
+            signal_quality_pct = RangeFinder::SIGNAL_QUALITY_MAX;
+        } else {
+            signal_quality_pct = static_cast<uint8_t>(sq);
+        }
+        return true;
+    }
+
+    // all readings were invalid so return out-of-range-high value
+    if (invalid_count > 0) {
+        signal_quality_pct = RangeFinder::SIGNAL_QUALITY_MIN;
+        // return out of range distance + 1m
+        reading_m = MIN(MAX(max_distance_cm(), max_reported_distance_mm * 0.01) + 100, UINT16_MAX) * 0.01f;
+        return true;
     }
 
     // no readings so return false
